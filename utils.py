@@ -252,3 +252,209 @@ def dijkstra(graph, start, end):
     shortest_path.append(start)
     shortest_path.reverse()
     return shortest_path if distances[end] != float('inf') else None
+
+class LMEForwardCurveBuilder:
+    
+    def build_curve(market_data, spread_data, previous_valuations, config):
+        """
+        INPUTS:
+            market_data: dict/DataFrame with outright prices for each prompt
+            spread_data: dict/DataFrame with spread prices between prompts
+            previous_valuations: dict/DataFrame with yesterday's curve
+            config: dict with configuration parameters
+            
+        OUTPUTS:
+            forward_curve: dict {prompt_date: price} for all dates
+            metadata: dict with quality metrics and diagnostics
+        """
+        
+        # STEP 1: Data Preprocessing and Quality Scoring
+        # Calculate quality score for each price observation
+        processed_outrights = {}
+        for prompt, data in market_data.items():
+            # Quality components
+            ba_quality = 1.0 / (1.0 + (data['ask'] - data['bid']) / data['mid'])
+            vol_quality = log(1 + data['volume']) / log(1 + max_volume)
+            rec_quality = exp(-hours_since_trade / config['time_decay_halflife'])
+            
+            # Overall quality (weighted average)
+            quality = (config['bid_ask_weight'] * ba_quality +
+                      config['volume_weight'] * vol_quality +
+                      config['recency_weight'] * rec_quality)
+            
+            # Reference price (prefer trade > mid > previous)
+            if data['last_trade']:
+                reference = data['last_trade']
+            elif data['mid']:
+                reference = data['mid']
+            else:
+                reference = previous_valuations[prompt]['previous_price']
+            
+            processed_outrights[prompt] = {
+                'reference_price': reference,
+                'quality': quality,
+                'bid': data['bid'],
+                'ask': data['ask']
+            }
+        
+        # Similar processing for spreads...
+        processed_spreads = preprocess_spreads(spread_data)
+        
+        # STEP 2: Establish Anchor Contract (3M)
+        # The 3M contract is most liquid and acts as anchor
+        anchor_date = get_3m_prompt_date()
+        anchor_price = processed_outrights[anchor_date]['reference_price']
+        anchor_bounds = (processed_outrights[anchor_date]['bid'],
+                        processed_outrights[anchor_date]['ask'])
+        
+        # STEP 3: Build Initial Curve from Spreads
+        # Use graph traversal through spread network
+        curve = {anchor_date: anchor_price}
+        priced_dates = {anchor_date}
+        
+        # Iteratively price prompts using spreads from already-priced dates
+        while len(priced_dates) < len(market_data):
+            for prompt in market_data.keys():
+                if prompt in priced_dates:
+                    continue
+                
+                # Find all spreads connecting this prompt to priced dates
+                implied_prices = []
+                for spread in processed_spreads:
+                    if spread['near'] in priced_dates and spread['far'] == prompt:
+                        # far = near + spread
+                        implied = curve[spread['near']] + spread['reference_spread']
+                        implied_prices.append((implied, spread['quality']))
+                    elif spread['far'] in priced_dates and spread['near'] == prompt:
+                        # near = far - spread
+                        implied = curve[spread['far']] - spread['reference_spread']
+                        implied_prices.append((implied, spread['quality']))
+                
+                if implied_prices:
+                    # Weighted average of implied prices
+                    total_weight = sum(w for _, w in implied_prices)
+                    curve[prompt] = sum(p * w for p, w in implied_prices) / total_weight
+                    priced_dates.add(prompt)
+        
+        # STEP 4: Identify Overlapping Spreads
+        # Example: Dec25-3M overlaps with Dec25-Jan26 and Jan26-3M
+        overlapping_constraints = []
+        
+        # For Dec25-3M spread
+        if exists_spread('Dec25', '3M') and exists_spread('Dec25', 'Jan26') and exists_spread('Jan26', '3M'):
+            # Constraint: Spread(Dec25, 3M) = Spread(Dec25, Jan26) + Spread(Jan26, 3M)
+            overlapping_constraints.append({
+                'direct_spread': ('Dec25', '3M'),
+                'component_spreads': [('Dec25', 'Jan26'), ('Jan26', '3M')]
+            })
+        
+        # Repeat for all overlapping combinations...
+        
+        # STEP 5: Constrained Optimization
+        # Minimize: weighted deviations from observations
+        # Subject to: arbitrage-free constraints
+        
+        from scipy.optimize import minimize
+        
+        prompt_dates = sorted(curve.keys())
+        n = len(prompt_dates)
+        date_to_idx = {date: i for i, date in enumerate(prompt_dates)}
+        
+        # Initial guess
+        x0 = array([curve[date] for date in prompt_dates])
+        
+        # Objective function
+        def objective(x):
+            loss = 0
+            
+            # Outright price deviations
+            for i, date in enumerate(prompt_dates):
+                ref = processed_outrights[date]['reference_price']
+                quality = processed_outrights[date]['quality']
+                loss += quality * (x[i] - ref)**2
+            
+            # Spread deviations
+            for spread in processed_spreads:
+                near_idx = date_to_idx[spread['near']]
+                far_idx = date_to_idx[spread['far']]
+                implied_spread = x[far_idx] - x[near_idx]
+                ref_spread = spread['reference_spread']
+                quality = spread['quality']
+                loss += quality * (implied_spread - ref_spread)**2
+            
+            # Smoothness penalty (optional)
+            for i in range(1, n-1):
+                second_deriv = x[i+1] - 2*x[i] + x[i-1]
+                loss += config['smoothness_penalty'] * second_deriv**2
+            
+            return loss
+        
+        # Constraints
+        constraints = []
+        
+        # Anchor constraint: x[3M] = anchor_price
+        anchor_idx = date_to_idx[anchor_date]
+        constraints.append({
+            'type': 'eq',
+            'fun': lambda x: x[anchor_idx] - anchor_price
+        })
+        
+        # Arbitrage-free constraints for overlapping spreads
+        for overlap in overlapping_constraints:
+            direct_near, direct_far = overlap['direct_spread']
+            components = overlap['component_spreads']
+            
+            # Direct spread = sum of component spreads ± tolerance
+            def arbitrage_constraint(x):
+                direct = x[date_to_idx[direct_far]] - x[date_to_idx[direct_near]]
+                synthetic = sum(x[date_to_idx[f]] - x[date_to_idx[n]] 
+                               for n, f in components)
+                return direct - synthetic  # Should be ~ 0
+            
+            constraints.append({
+                'type': 'eq',
+                'fun': arbitrage_constraint
+            })
+        
+        # Bounds (bid-ask constraints)
+        bounds = [(processed_outrights[date]['bid'], 
+                   processed_outrights[date]['ask']) 
+                  for date in prompt_dates]
+        
+        # Solve optimization
+        result = minimize(
+            objective,
+            x0,
+            method=config['optimization_method'],
+            constraints=constraints,
+            bounds=bounds,
+            options={'maxiter': 1000, 'ftol': 1e-9}
+        )
+        
+        if not result.success:
+            # Handle optimization failure
+            # Fallback: use initial curve or relax constraints
+            pass
+        
+        optimized_curve = {date: result.x[i] for i, date in enumerate(prompt_dates)}
+        
+        # STEP 6: Validation
+        validation_report = validate_curve(optimized_curve, market_data, spread_data, 
+                                          overlapping_constraints, config['arbitrage_tolerance'])
+        
+        # STEP 7: Interpolation for Full Daily Curve
+        # Use monotonic cubic spline for missing dates
+        from scipy.interpolate import PchipInterpolator
+        complete_curve = interpolate_daily(optimized_curve)
+        
+        # OUTPUT
+        metadata = {
+            'timestamp': datetime.now(),
+            'anchor_price': anchor_price,
+            'num_prompts': len(optimized_curve),
+            'optimization_status': result.success,
+            'arbitrage_violations': validation_report['arbitrage_violations'],
+            'max_deviation': validation_report['max_deviation']
+        }
+        
+        return complete_curve, metadata

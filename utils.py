@@ -458,3 +458,49 @@ class LMEForwardCurveBuilder:
         }
         
         return complete_curve, metadata
+
+
+# INPUT 1: Market Data for Outright Contracts
+MARKET_DATA = {
+    'prompt_date': datetime,           # Settlement date
+    'bid': float,                      # Bid price ($/tonne)
+    'ask': float,                      # Ask price ($/tonne)
+    'mid': float,                      # (bid + ask) / 2
+    'last_trade': float,               # Last traded price
+    'trade_volume': float,             # Volume in lots
+    'num_trades': int,                 # Number of trades
+    'timestamp': datetime,             # Time of last update
+    'contract_type': str               # 'cash', '3M', 'daily', 'weekly', 'monthly'
+}
+
+# INPUT 2: Spread (Carry) Data
+SPREAD_DATA = {
+    'near_leg': datetime,              # Near prompt date
+    'far_leg': datetime,               # Far prompt date
+    'spread_bid': float,               # Bid for spread (far - near)
+    'spread_ask': float,               # Ask for spread
+    'spread_mid': float,               # Mid spread
+    'spread_last_trade': float,        # Last traded spread
+    'spread_volume': float,            # Volume traded
+    'spread_num_trades': int,          # Number of trades
+    'timestamp': datetime
+}
+
+# INPUT 3: Previous Valuations (for continuity)
+PREVIOUS_VALUATIONS = {
+    'prompt_date': datetime,
+    'previous_price': float,           # Yesterday's valuation
+    'previous_timestamp': datetime
+}
+
+# INPUT 4: Configuration
+CONFIG = {
+    'anchor_contract': '3M',
+    'bid_ask_weight': 0.4,            # Weight for bid-ask quality
+    'volume_weight': 0.3,             # Weight for volume quality
+    'recency_weight': 0.3,            # Weight for recency quality
+    'time_decay_halflife': 2.0,       # Hours for exponential decay
+    'arbitrage_tolerance': 0.01,      # $/tonne tolerance
+    'smoothness_penalty': 0.05,       # Optional smoothness weight
+    'optimization_method': 'SLSQP'    # or 'cvxpy'
+}
